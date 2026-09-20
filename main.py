@@ -142,17 +142,49 @@ async def cb_ref(cq: CallbackQuery):
 # ---------- déploiement ----------
 @r.callback_query(F.data == "deploy")
 async def cb_deploy(cq: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit(cq, ("🤖 <b>Déployer un bot</b>\n\nQuel type de bot veux-tu déployer ?\n\n"
+                    "🟢 <b>Bot Node.js</b> : ton bot n'utilise pas de token Telegram. "
+                    "Aucun token ne sera demandé.\n\n"
+                    "🤖 <b>Bot Telegram</b> : ton bot est un bot Telegram, même s'il est en Node.js. "
+                    "Le panel te demandera son token."),
+               kb([("🟢 Bot Node.js", "deploy:node"), ("🤖 Bot Telegram", "deploy:tg")],
+                  [("⬅️ Retour", "home")]))
+
+
+@r.callback_query(F.data.startswith("deploy:"))
+async def cb_deploy_kind(cq: CallbackQuery, state: FSMContext):
+    kind = cq.data.split(":")[1]
+    if kind not in ("node", "tg"):
+        return await cq.answer()
     uid = cq.from_user.id
     if len(db.user_bots(uid)) >= MAX_BOTS:
         return await cq.answer(f"Limite de {MAX_BOTS} bots atteinte.", show_alert=True)
     if db.get_user(uid)["coins"] < DEPLOY_COST:
         return await cq.answer(f"Il faut {DEPLOY_COST} 🪙 pour déployer.", show_alert=True)
     await state.set_state(Deploy.file)
-    await edit(cq, ("🤖 <b>Déployer un bot</b>\n\nEnvoie ton code :\n• un fichier <code>.py</code> ou <code>.js</code>, ou\n"
+    await state.update_data(kind=kind)
+    title = "🟢 <b>Bot Node.js</b>" if kind == "node" else "🤖 <b>Bot Telegram</b>"
+    tail = ("Aucun token Telegram ne sera demandé." if kind == "node"
+            else "Je te demanderai ensuite le token du bot (BotFather).")
+    await edit(cq, (f"{title}\n\nEnvoie ton code :\n• un fichier <code>.py</code> ou <code>.js</code>, ou\n"
                     "• un <code>.zip</code> (avec <code>main.py</code>, <code>index.js</code> ou <code>package.json</code>, "
-                    "et un <code>requirements.txt</code> si besoin). Sans <code>node_modules</code> : il est installé automatiquement.\n\nMax 20 Mo. Python ou Node.js.\n"
-                    "Ton code lira le token via la variable <code>BOT_TOKEN</code>."),
+                    "et un <code>requirements.txt</code> si besoin). Sans <code>node_modules</code> : "
+                    "il est installé automatiquement.\n\nMax 20 Mo. Python ou Node.js.\n" + tail),
                kb([("❌ Annuler", "home")]))
+
+
+def bot_label(root, entry):
+    """Nom affiché pour un bot sans token Telegram."""
+    import json
+    try:
+        with open(os.path.join(root, "package.json"), encoding="utf-8", errors="ignore") as f:
+            n = json.load(f).get("name")
+        if isinstance(n, str) and n.strip():
+            return n.strip()[:40]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return os.path.basename(root.rstrip("/"))[:40] or entry
 
 
 @r.message(Deploy.file, F.document)
@@ -182,16 +214,20 @@ async def deploy_file(m: Message, state: FSMContext):
     root, entry = runner.locate(dest)
     if not entry:
         shutil.rmtree(dest, ignore_errors=True)
-        return await m.answer("❌ Aucun fichier principal trouvé (main.py, bot.py, app.py…).")
+        return await m.answer("❌ Aucun fichier principal trouvé (main.py, bot.py, app.py, index.js…).")
     issues = await asyncio.to_thread(runner.scan, root)
     if issues:
         shutil.rmtree(dest, ignore_errors=True)
         await state.clear()
         return await m.answer("⛔ Code refusé à la vérification :\n" + "\n".join(f"• {esc(i)}" for i in issues))
+    kind = (await state.get_data()).get("kind", "tg")
     await state.update_data(dest=dest, root=root, entry=entry)
+    if kind == "node":
+        await m.answer(f"✅ Code reçu (<code>{esc(entry)}</code>). Déploiement…")
+        return await finish_deploy(m, state, "")
     await state.set_state(Deploy.token)
     await m.answer(f"✅ Code reçu (<code>{esc(entry)}</code>).\n\nEnvoie maintenant le <b>token</b> de ton bot "
-                   "(BotFather). Ton message sera supprimé.")
+                   "Telegram (BotFather). Ton message sera supprimé.")
 
 
 @r.message(Deploy.file)
@@ -208,34 +244,43 @@ async def deploy_token(m: Message, state: FSMContext):
         pass
     if not TOKEN_RE.match(tok):
         return await m.answer("Token invalide. Réessaie (ou /start pour annuler).")
+    await finish_deploy(m, state, tok)
+
+
+async def finish_deploy(m: Message, state: FSMContext, tok: str):
+    """tok vide = bot sans token Telegram (bouton Bot Node.js)."""
     data = await state.get_data()
-    tb = Bot(tok)
-    try:
-        me = await tb.get_me()
-    except Exception:
-        return await m.answer("❌ Token refusé par Telegram. Vérifie-le.")
-    finally:
-        await tb.session.close()
+    if tok:
+        tb = Bot(tok)
+        try:
+            me = await tb.get_me()
+        except Exception:
+            return await m.answer("❌ Token refusé par Telegram. Vérifie-le.")
+        finally:
+            await tb.session.close()
+        name = "@" + me.username
+    else:
+        name = bot_label(data["root"], data["entry"])
     uid = m.from_user.id
     if not db.spend(uid, DEPLOY_COST):
         shutil.rmtree(data["dest"], ignore_errors=True)
         await state.clear()
         return await m.answer("Solde insuffisant.")
     status = "pending" if REQUIRE_APPROVAL and uid not in ADMINS else "stopped"
-    bid = db.add_bot(uid, "@" + me.username, data["dest"], data["root"], data["entry"], tok, status)
+    bid = db.add_bot(uid, name, data["dest"], data["root"], data["entry"], tok, status)
     await state.clear()
     if status == "pending":
-        await m.answer(f"📦 <b>@{esc(me.username)}</b> envoyé. En attente de validation par un admin.",
+        await m.answer(f"📦 <b>{esc(name)}</b> envoyé. En attente de validation par un admin.",
                        reply_markup=kb([("📂 Mes bots", "mybots")]))
         for a in ADMINS:
             try:
                 await m.bot.send_message(
-                    a, f"🆕 Bot #{bid} @{esc(me.username)} de <code>{uid}</code> à valider.",
+                    a, f"🆕 Bot #{bid} {esc(name)} de <code>{uid}</code> à valider.",
                     reply_markup=kb([(f"✅ Approuver #{bid}", f"adm:ok:{bid}"), (f"❌ Refuser #{bid}", f"adm:no:{bid}")]))
             except Exception:
                 pass
     else:
-        await m.answer(f"✅ <b>@{esc(me.username)}</b> déployé. Lance-le depuis le panel.",
+        await m.answer(f"✅ <b>{esc(name)}</b> déployé. Lance-le depuis le panel.",
                        reply_markup=kb([(f"Ouvrir #{bid}", f"bot:{bid}")]))
 
 

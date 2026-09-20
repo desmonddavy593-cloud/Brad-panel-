@@ -185,6 +185,9 @@ def start(bid, token, root, entry):
         NODE_ENV="production",
         NODE_OPTIONS=f"--max-old-space-size={max(64, MAX_MEM_MB * 3 // 4)}",
     )
+    if not token:
+        for k in ("BOT_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN"):
+            env.pop(k, None)
     log = open(os.path.join(root, "bot.log"), "ab")
     log.write(f"\n--- démarrage {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode())
     log.flush()
