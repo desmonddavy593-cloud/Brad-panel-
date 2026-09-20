@@ -20,8 +20,8 @@ MAX_MEM_MB = int(os.getenv("BOT_MAX_MEM_MB", "512"))
 procs = {}  # bot_id -> Popen
 
 _BAD = re.compile(
-    r"xmrig|stratum\+tcp|cryptonight|minerd|panel\.db|/proc/|RAILWAY_|ADMIN_IDS|"
-    + re.escape(os.path.abspath(DATA_DIR)),
+    r"xmrig|stratum\+tcp|cryptonight|minerd|panel\.db|/proc/|RAILWAY_|"
+    r"(?<![\w.~])" + re.escape(os.path.abspath(DATA_DIR)) + r"(?![\w-])",
     re.I,
 )
 
@@ -178,6 +178,8 @@ def start(bid, token, root, entry):
         base_env,
         BOT_TOKEN=token,
         TOKEN=token,
+        TELEGRAM_BOT_TOKEN=token,
+        PORT=str(20000 + bid),
         PYTHONUNBUFFERED="1",
         PYTHONPATH=libs,
         NODE_ENV="production",
