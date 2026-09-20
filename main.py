@@ -14,7 +14,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import db
 import runner
@@ -54,7 +54,9 @@ def esc(s):
 
 def kb(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
+        [InlineKeyboardButton(text=t, url=d) if d.startswith("http")
+         else InlineKeyboardButton(text=t, callback_data=d) for t, d in row]
+        for row in rows
     ])
 
 
@@ -65,23 +67,70 @@ def dur(s):
 
 async def edit(cq: CallbackQuery, text, markup=None):
     try:
-        await cq.message.edit_text(text, reply_markup=markup)
+        if cq.message.photo:  # l'accueil est une photo : on la remplace par un message texte
+            try:
+                await cq.message.delete()
+            except Exception:
+                pass
+            await cq.message.answer(text, reply_markup=markup)
+        else:
+            await cq.message.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         pass
 
 
+TG_CHANNEL = os.getenv("LINK_TG_CHANNEL", "https://t.me/+hmrEUs5totIyMzhk")
+TG_GROUP = os.getenv("LINK_TG_GROUP", "https://t.me/+0U1iB2uBXcJiOWFk")
+WA_CHANNEL = os.getenv("LINK_WA_CHANNEL", "https://whatsapp.com/channel/0029VbCmpwK89inpJICAG21A")
+WA_COMMUNITY = os.getenv("LINK_WA_COMMUNITY", "https://chat.whatsapp.com/IdqsjNUpc6s0DgAEvKGV1S")
+WA_GROUP = os.getenv("LINK_WA_GROUP", "https://chat.whatsapp.com/GMADVR2wFJp90J5KqkPf6F?s=cl&p=a&mlu=4&ilr=4")
+WELCOME_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "welcome.jpg")
+_welcome_file_id = None
+
+
 def home_markup(uid):
-    rows = [[("🤖 Déployer un bot", "deploy"), ("📂 Mes bots", "mybots")],
-            [("👤 Mon compte", "acct"), ("🎁 Parrainage", "ref")]]
+    rows = [
+        [("📢 Canal Telegram", TG_CHANNEL), ("💬 Groupe Telegram", TG_GROUP)],
+        [("📱 Chaîne WhatsApp", WA_CHANNEL)],
+        [("👥 Communauté WhatsApp", WA_COMMUNITY), ("💬 Groupe WhatsApp", WA_GROUP)],
+        [("🤖 Déployer un bot", "deploy"), ("📂 Mes bots", "mybots")],
+        [("👤 Mon compte", "acct"), ("🎁 Parrainage", "ref")],
+        [("🎟️ Code cadeau", "gift")],
+    ]
     if uid in ADMINS:
         rows.append([("🛠️ Admin", "admin")])
     return kb(*rows)
 
 
-def home_text(uid):
+def home_text(uid, first_name=""):
     u = db.get_user(uid)
-    return (f"🤖 <b>Brad Society Panel</b>\n\nDépose ton bot Telegram, on l'héberge.\n"
-            f"🪙 Solde : <b>{u['coins']}</b>")
+    name = esc(first_name or "")
+    hello = f"Bienvenue, {name} !" if name else "Bienvenue !"
+    return ("━━━━━━━━━━━━━━━━━━\n"
+            "👑 <b>BRAD SOCIETY</b> 👑\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"👋 <b>{hello}</b>\n\n"
+            "<blockquote>Envoie ton bot, on s'occupe de le faire tourner. "
+            "Tu gères tout depuis Telegram : démarrage, arrêt, logs.</blockquote>\n\n"
+            f"🎁 <b>{WELCOME_COINS} 🪙 offerts</b> pour bien commencer\n"
+            f"🪙 <b>Ton solde : {u['coins']} 🪙</b>\n\n"
+            "Rejoins la communauté juste en dessous 👇")
+
+
+async def send_home(bot: Bot, chat_id, uid, first_name=""):
+    """Accueil : image + texte + boutons (texte seul si l'image est absente)."""
+    global _welcome_file_id
+    text, markup = home_text(uid, first_name), home_markup(uid)
+    if _welcome_file_id or os.path.exists(WELCOME_IMAGE):
+        try:
+            msg = await bot.send_photo(chat_id, _welcome_file_id or FSInputFile(WELCOME_IMAGE),
+                                       caption=text, reply_markup=markup)
+            if msg.photo:
+                _welcome_file_id = msg.photo[-1].file_id
+            return
+        except Exception:
+            logging.exception("image d'accueil")
+    await bot.send_message(chat_id, text, reply_markup=markup)
 
 
 def owned(uid, bid):
@@ -111,13 +160,18 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
             except Exception:
                 pass
         await m.answer(f"🎉 Bienvenue ! Tu reçois <b>{WELCOME_COINS} 🪙</b> gratuits.")
-    await m.answer(home_text(uid), reply_markup=home_markup(uid))
+    await send_home(m.bot, m.chat.id, uid, m.from_user.first_name)
 
 
 @r.callback_query(F.data == "home")
 async def cb_home(cq: CallbackQuery, state: FSMContext):
     await state.clear()
-    await edit(cq, home_text(cq.from_user.id), home_markup(cq.from_user.id))
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await send_home(cq.bot, cq.from_user.id, cq.from_user.id, cq.from_user.first_name)
+    await cq.answer()
 
 
 # ---------- compte / parrainage ----------
@@ -427,7 +481,7 @@ async def cmd_addcoins(m: Message, command: CommandObject):
     try:
         uid, n = map(int, command.args.split())
     except Exception:
-        return await m.answer("Usage : /addcoins <id> <n>")
+        return await m.answer("Usage : /addcoins &lt;id&gt; &lt;n&gt;")
     if not db.get_user(uid):
         return await m.answer("Utilisateur inconnu.")
     db.add_coins(uid, n)
@@ -441,7 +495,7 @@ async def cmd_stopbot(m: Message, command: CommandObject):
     try:
         bid = int(command.args)
     except Exception:
-        return await m.answer("Usage : /stopbot <bot_id>")
+        return await m.answer("Usage : /stopbot &lt;bot_id&gt;")
     await asyncio.to_thread(runner.stop, bid)
     db.set_status(bid, "stopped")
     await m.answer(f"Bot #{bid} arrêté.")
@@ -460,6 +514,81 @@ async def cmd_broadcast(m: Message, command: CommandObject):
             pass
         await asyncio.sleep(0.05)
     await m.answer(f"Envoyé à {ok} utilisateurs.")
+
+
+# ---------- codes cadeaux ----------
+class Gift(StatesGroup):
+    code = State()
+
+
+_gift_fails = {}  # anti-brute-force : uid -> horodatages des échecs
+GIFT_ERRORS = {
+    "invalid": "❌ Code invalide.",
+    "expired": "⌛ Ce code a expiré.",
+    "exhausted": "😕 Ce code a atteint son nombre maximum d'utilisations.",
+    "already": "⚠️ Tu as déjà utilisé ce code.",
+}
+
+
+@r.callback_query(F.data == "gift")
+async def cb_gift(cq: CallbackQuery, state: FSMContext):
+    await state.set_state(Gift.code)
+    await edit(cq, "🎟️ <b>Code cadeau</b>\n\nEnvoie ton code pour recevoir des 🪙.",
+               kb([("❌ Annuler", "home")]))
+
+
+@r.message(Command("newcode"))
+async def cmd_newcode(m: Message, command: CommandObject):
+    if not is_admin(m.from_user.id):
+        return
+    import secrets
+    usage = "Usage : /newcode &lt;CODE ou auto&gt; &lt;coins&gt; &lt;utilisations max&gt; [jours]"
+    try:
+        p = (command.args or "").split()
+        code, coins, uses = p[0].upper(), int(p[1]), int(p[2])
+        days = int(p[3]) if len(p) > 3 else 0
+        if coins <= 0 or uses <= 0 or days < 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        return await m.answer(usage)
+    if code == "AUTO":
+        code = "BRAD-" + secrets.token_hex(3).upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+        return await m.answer("Code invalide (A-Z, 0-9, - et _ ; 3 à 32 caractères).")
+    expires = time.time() + days * 86400 if days else None
+    if not db.create_code(code, coins, uses, expires):
+        return await m.answer("Ce code existe déjà.")
+    await m.answer(f"✅ Code créé : <code>{code}</code>\n{coins} 🪙 · {uses} utilisation(s)"
+                   + (f" · expire dans {days} j" if days else ""))
+
+
+@r.message(Command("codes"))
+async def cmd_codes(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    rows = db.list_codes()
+    if not rows:
+        return await m.answer("Aucun code.")
+    lines = []
+    for c in rows:
+        exp = time.strftime("%d/%m", time.localtime(c["expires"])) if c["expires"] else "∞"
+        lines.append(f"<code>{c['code']}</code> · {c['coins']} 🪙 · {c['used']}/{c['max_uses']} · exp {exp}")
+    await m.answer("🎟️ <b>Codes</b>\n" + "\n".join(lines))
+
+
+@r.message(Gift.code, F.text)
+async def gift_code(m: Message, state: FSMContext):
+    uid, now = m.from_user.id, time.time()
+    fails = [t for t in _gift_fails.get(uid, []) if now - t < 3600]
+    if len(fails) >= 5:
+        return await m.answer("⛔ Trop d'essais. Réessaie dans une heure.")
+    status, coins = db.redeem_code(uid, m.text)
+    if status != "ok":
+        fails.append(now)
+        _gift_fails[uid] = fails
+        return await m.answer(GIFT_ERRORS[status] + "\nRéessaie, ou /start pour annuler.")
+    await state.clear()
+    await m.answer(f"🎉 Code validé ! <b>+{coins} 🪙</b>", reply_markup=kb([("🏠 Menu", "home")]))
 
 
 # ---------- surveillance ----------

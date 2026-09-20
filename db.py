@@ -98,3 +98,55 @@ def counts():
         "running": _one("SELECT COUNT(*) c FROM bots WHERE status='running'")["c"],
         "pending": _one("SELECT COUNT(*) c FROM bots WHERE status='pending'")["c"],
     }
+
+
+# ---- codes cadeaux
+_c.executescript("""
+CREATE TABLE IF NOT EXISTS codes(
+  code TEXT PRIMARY KEY, coins INTEGER NOT NULL, max_uses INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0, expires REAL, created REAL
+);
+CREATE TABLE IF NOT EXISTS code_uses(
+  code TEXT NOT NULL, uid INTEGER NOT NULL, ts REAL, PRIMARY KEY(code, uid)
+);
+""")
+
+
+def create_code(code, coins, max_uses, expires=None):
+    with _l:
+        if _c.execute("SELECT 1 FROM codes WHERE code=?", (code,)).fetchone():
+            return False
+        _c.execute("INSERT INTO codes(code,coins,max_uses,expires,created) VALUES(?,?,?,?,?)",
+                   (code, coins, max_uses, expires, time.time()))
+        return True
+
+
+def list_codes(limit=30):
+    return _x("SELECT * FROM codes ORDER BY created DESC LIMIT ?", (limit,))[0]
+
+
+def redeem_code(uid, code):
+    """Retourne (statut, coins) ; statut = ok | invalid | expired | exhausted | already."""
+    code = (code or "").strip().upper()
+    with _l:
+        _c.execute("BEGIN IMMEDIATE")
+        try:
+            row = _c.execute("SELECT * FROM codes WHERE code=?", (code,)).fetchone()
+            if not row:
+                res = ("invalid", 0)
+            elif row["expires"] and row["expires"] < time.time():
+                res = ("expired", 0)
+            elif row["used"] >= row["max_uses"]:
+                res = ("exhausted", 0)
+            elif _c.execute("SELECT 1 FROM code_uses WHERE code=? AND uid=?", (code, uid)).fetchone():
+                res = ("already", 0)
+            else:
+                _c.execute("INSERT INTO code_uses(code,uid,ts) VALUES(?,?,?)", (code, uid, time.time()))
+                _c.execute("UPDATE codes SET used=used+1 WHERE code=?", (code,))
+                _c.execute("UPDATE users SET coins=coins+? WHERE id=?", (row["coins"], uid))
+                res = ("ok", row["coins"])
+            _c.execute("COMMIT")
+            return res
+        except Exception:
+            _c.execute("ROLLBACK")
+            raise
