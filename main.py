@@ -31,7 +31,7 @@ REF_BONUS = int(os.getenv("REF_BONUS", "50"))
 MAX_REFS = int(os.getenv("MAX_REFS", "20"))       # anti-abus parrainage
 MAX_BOTS = int(os.getenv("MAX_BOTS_PER_USER", "3"))
 REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "1") == "1"
-MAX_UPLOAD = 5 * 1024 * 1024
+MAX_UPLOAD = 20 * 1024 * 1024
 TOKEN_RE = re.compile(r"^\d{6,12}:[\w-]{30,}$")
 
 STATUS = {
@@ -148,9 +148,9 @@ async def cb_deploy(cq: CallbackQuery, state: FSMContext):
     if db.get_user(uid)["coins"] < DEPLOY_COST:
         return await cq.answer(f"Il faut {DEPLOY_COST} 🪙 pour déployer.", show_alert=True)
     await state.set_state(Deploy.file)
-    await edit(cq, ("🤖 <b>Déployer un bot</b>\n\nEnvoie ton code :\n• un fichier <code>.py</code>, ou\n"
-                    "• un <code>.zip</code> (avec <code>main.py</code> ou <code>bot.py</code>, "
-                    "et un <code>requirements.txt</code> si besoin)\n\nMax 5 MB. Python uniquement.\n"
+    await edit(cq, ("🤖 <b>Déployer un bot</b>\n\nEnvoie ton code :\n• un fichier <code>.py</code> ou <code>.js</code>, ou\n"
+                    "• un <code>.zip</code> (avec <code>main.py</code>, <code>index.js</code> ou <code>package.json</code>, "
+                    "et un <code>requirements.txt</code> si besoin). Sans <code>node_modules</code> : il est installé automatiquement.\n\nMax 20 Mo. Python ou Node.js.\n"
                     "Ton code lira le token via la variable <code>BOT_TOKEN</code>."),
                kb([("❌ Annuler", "home")]))
 
@@ -159,10 +159,10 @@ async def cb_deploy(cq: CallbackQuery, state: FSMContext):
 async def deploy_file(m: Message, state: FSMContext):
     d = m.document
     name = (d.file_name or "").lower()
-    if not name.endswith((".py", ".zip")):
-        return await m.answer("Envoie un fichier .py ou .zip.")
+    if not name.endswith((".py", ".js", ".zip")):
+        return await m.answer("Envoie un fichier .py, .js ou .zip.")
     if d.file_size and d.file_size > MAX_UPLOAD:
-        return await m.answer("Fichier trop gros (5 MB max).")
+        return await m.answer("Fichier trop gros (20 Mo max).")
     dest = os.path.join(runner.BOTS_DIR, f"{m.from_user.id}_{int(time.time())}")
     tmp = dest + ".tmp"
     os.makedirs(dest)
@@ -196,7 +196,7 @@ async def deploy_file(m: Message, state: FSMContext):
 
 @r.message(Deploy.file)
 async def deploy_file_wrong(m: Message):
-    await m.answer("Envoie un fichier .py ou .zip (ou /start pour annuler).")
+    await m.answer("Envoie un fichier .py, .js ou .zip (ou /start pour annuler).")
 
 
 @r.message(Deploy.token, F.text)
