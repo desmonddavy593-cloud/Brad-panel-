@@ -6,7 +6,7 @@ import re
 import shutil
 import time
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -30,6 +30,7 @@ DAY_COST = int(os.getenv("DAY_COST", "10"))       # coût de 24h d'hébergement
 REF_BONUS = int(os.getenv("REF_BONUS", "50"))
 MAX_REFS = int(os.getenv("MAX_REFS", "20"))       # anti-abus parrainage
 MAX_BOTS = int(os.getenv("MAX_BOTS_PER_USER", "3"))
+PREMIUM_MAX_BOTS = int(os.getenv("PREMIUM_MAX_BOTS", "3"))
 REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "1") == "1"
 MAX_UPLOAD = 20 * 1024 * 1024
 TOKEN_RE = re.compile(r"^\d{6,12}:[\w-]{30,}$")
@@ -97,13 +98,13 @@ def home_markup(uid):
         [("👤 Mon compte", "acct"), ("🎁 Parrainage", "ref")],
         [("🎟️ Code cadeau", "gift")],
     ]
-    if uid in ADMINS:
+    if is_admin(uid):
         rows.append([("🛠️ Admin", "admin")])
     return kb(*rows)
 
 
-def home_text(uid, first_name=""):
-    u = db.get_user(uid)
+def home_text(uid, first_name="", locked=False):
+    u = db.get_user(uid) or {"coins": 0}
     name = esc(first_name or "")
     hello = f"Bienvenue, {name} !" if name else "Bienvenue !"
     return ("━━━━━━━━━━━━━━━━━━\n"
@@ -114,13 +115,24 @@ def home_text(uid, first_name=""):
             "Tu gères tout depuis Telegram : démarrage, arrêt, logs.</blockquote>\n\n"
             f"🎁 <b>{WELCOME_COINS} 🪙 offerts</b> pour bien commencer\n"
             f"🪙 <b>Ton solde : {u['coins']} 🪙</b>\n\n"
-            "Rejoins la communauté juste en dessous 👇")
+            + ("🔒 <b>Rejoins le canal et le groupe Telegram</b> ci-dessous, puis touche "
+               "« ✅ J'ai rejoint » pour utiliser le bot."
+               if locked else "Rejoins la communauté juste en dessous 👇"))
 
 
 async def send_home(bot: Bot, chat_id, uid, first_name=""):
     """Accueil : image + texte + boutons (texte seul si l'image est absente)."""
     global _welcome_file_id
-    text, markup = home_text(uid, first_name), home_markup(uid)
+    locked = bool(await missing_chats(bot, uid))
+    text = home_text(uid, first_name, locked)
+    markup = gate_markup() if locked else home_markup(uid)
+    custom = db.get_setting("welcome_photo")  # image choisie par un admin
+    if custom:
+        try:
+            await bot.send_photo(chat_id, custom, caption=text, reply_markup=markup)
+            return
+        except Exception:
+            logging.exception("image d'accueil personnalisée")
     if _welcome_file_id or os.path.exists(WELCOME_IMAGE):
         try:
             msg = await bot.send_photo(chat_id, _welcome_file_id or FSInputFile(WELCOME_IMAGE),
@@ -135,7 +147,7 @@ async def send_home(bot: Bot, chat_id, uid, first_name=""):
 
 def owned(uid, bid):
     b = db.get_bot(bid)
-    return b if b and (b["owner"] == uid or uid in ADMINS) else None
+    return b if b and (b["owner"] == uid or is_admin(uid)) else None
 
 
 # ---------- /start ----------
@@ -180,7 +192,7 @@ async def cb_acct(cq: CallbackQuery):
     u = db.get_user(cq.from_user.id)
     n = len(db.user_bots(u["id"]))
     await edit(cq, (f"👤 <b>Mon compte</b>\n\nID : <code>{u['id']}</code>\n🪙 Solde : <b>{u['coins']}</b>\n"
-                    f"🤖 Bots : {n}/{MAX_BOTS}\n\n<b>Tarifs</b>\nDéploiement : {DEPLOY_COST} 🪙\n"
+                    f"🤖 Bots : {n}/{bot_limit(u['id'])}{' ⭐ Premium' if db.is_premium(u['id']) else ''}\n\n<b>Tarifs</b>\nDéploiement : {DEPLOY_COST} 🪙\n"
                     f"24h d'hébergement : {DAY_COST} 🪙"), kb([("⬅️ Retour", "home")]))
 
 
@@ -212,8 +224,9 @@ async def cb_deploy_kind(cq: CallbackQuery, state: FSMContext):
     if kind not in ("node", "tg"):
         return await cq.answer()
     uid = cq.from_user.id
-    if len(db.user_bots(uid)) >= MAX_BOTS:
-        return await cq.answer(f"Limite de {MAX_BOTS} bots atteinte.", show_alert=True)
+    limit = bot_limit(uid)
+    if len(db.user_bots(uid)) >= limit:
+        return await cq.answer(f"Limite de {limit} bot(s) atteinte.", show_alert=True)
     if db.get_user(uid)["coins"] < DEPLOY_COST:
         return await cq.answer(f"Il faut {DEPLOY_COST} 🪙 pour déployer.", show_alert=True)
     await state.set_state(Deploy.file)
@@ -320,13 +333,13 @@ async def finish_deploy(m: Message, state: FSMContext, tok: str):
         shutil.rmtree(data["dest"], ignore_errors=True)
         await state.clear()
         return await m.answer("Solde insuffisant.")
-    status = "pending" if REQUIRE_APPROVAL and uid not in ADMINS else "stopped"
+    status = "pending" if REQUIRE_APPROVAL and not is_admin(uid) else "stopped"
     bid = db.add_bot(uid, name, data["dest"], data["root"], data["entry"], tok, status)
     await state.clear()
     if status == "pending":
         await m.answer(f"📦 <b>{esc(name)}</b> envoyé. En attente de validation par un admin.",
                        reply_markup=kb([("📂 Mes bots", "mybots")]))
-        for a in ADMINS:
+        for a in all_admins():
             try:
                 await m.bot.send_message(
                     a, f"🆕 Bot #{bid} {esc(name)} de <code>{uid}</code> à valider.",
@@ -433,21 +446,360 @@ async def cb_act(cq: CallbackQuery):
 
 # ---------- admin ----------
 def is_admin(uid):
-    return uid in ADMINS
+    return uid in ADMINS or db.is_db_admin(uid)
+
+
+def all_admins():
+    return set(ADMINS) | set(db.admin_ids())
+
+
+def bot_limit(uid):
+    return PREMIUM_MAX_BOTS if db.is_premium(uid) else MAX_BOTS
 
 
 @r.callback_query(F.data == "admin")
-async def cb_admin(cq: CallbackQuery):
+async def cb_admin(cq: CallbackQuery, state: FSMContext = None):
     if not is_admin(cq.from_user.id):
         return await cq.answer()
-    c = db.counts()
-    rows = []
-    for b in db.bots_by_status("pending"):
-        rows.append([(f"✅ #{b['id']} {b['name']}", f"adm:ok:{b['id']}"), (f"❌ #{b['id']}", f"adm:no:{b['id']}")])
+    if state:
+        await state.clear()
+    c, s = db.counts(), db.user_stats()
+    await edit(cq, (f"🛠️ <b>Administration</b>\n\n👥 {s['total']} utilisateurs · "
+                    f"🤖 {c['bots']} bots (🟢 {c['running']})"), admin_menu_kb())
+
+
+# ---------- interface administrateur ----------
+class AdminFlow(StatesGroup):
+    wait = State()
+    photo = State()
+
+
+PROMPTS = {
+    "search": "🔎 Envoie l'ID ou le @pseudo de l'utilisateur.",
+    "add_admin": "➕ Envoie l'ID ou le @pseudo du futur administrateur (il doit avoir ouvert le bot).",
+    "prem_add": "⭐ Envoie l'ID ou le @pseudo de l'utilisateur à passer premium.",
+    "prem_del": "➖ Envoie l'ID ou le @pseudo de l'utilisateur à qui retirer le premium.",
+    "coins": ("🪙 Envoie : ID_ou_@pseudo montant\n"
+              "Ex : 123456789 50 (donner) ou 123456789 -20 (retirer)"),
+    "ban": "🚫 Envoie l'ID ou le @pseudo de l'utilisateur à bannir.",
+    "unban": "✅ Envoie l'ID ou le @pseudo de l'utilisateur à débannir.",
+    "bc": "📢 Envoie le message à diffuser à tous les utilisateurs (texte simple).",
+    "code_new": ("🎟️ Envoie : CODE coins utilisations [jours]\n"
+                 "Ex : BIENVENUE 50 20 7  (écris auto à la place du code pour en générer un)"),
+    "code_del": "🗑️ Envoie le code à supprimer.",
+}
+_tasks = set()
+
+
+def uname(u):
+    return ("@" + esc(u["username"])) if u and u["username"] else "(sans pseudo)"
+
+
+def admin_menu_kb():
+    rows = [[("👥 Utilisateurs", "ad:users"), ("🤖 Bots", "ad:bots")],
+            [("🎟️ Codes cadeaux", "ad:codes"), ("🖼️ Image du menu", "ad:img")],
+            [("⭐ Premium", "ad:prem"), ("👮 Administrateurs", "ad:admins")],
+            [("🪙 Coins", "ad:ask:coins"), ("🚫 Bannir", "ad:ban")],
+            [("📢 Diffusion", "ad:ask:bc"), ("🔒 Obligation de rejoindre", "ad:gate")]]
+    pend = db.counts()["pending"]
+    if pend:
+        rows.insert(0, [(f"🟡 À valider ({pend})", "ad:pending")])
     rows.append([("⬅️ Retour", "home")])
-    await edit(cq, (f"🛠️ <b>Admin</b>\n\n👥 Utilisateurs : {c['users']}\n🤖 Bots : {c['bots']} "
-                    f"(🟢 {c['running']})\n🟡 À valider : {c['pending']}\n\n"
-                    "/addcoins &lt;id&gt; &lt;n&gt;\n/stopbot &lt;bot_id&gt;\n/broadcast &lt;texte&gt;"), kb(*rows))
+    return kb(*rows)
+
+
+def admin_bots_screen():
+    bots = db.all_bots(15)
+    back = [("⬅️ Admin", "admin")]
+    if not bots:
+        return "🤖 <b>Bots</b>\n\nAucun bot.", kb(back)
+    lines, rows = [], []
+    for b in bots:
+        lines.append(f"{STATUS[b['status']][:2]} #{b['id']} {esc(b['name'])} · <code>{b['owner']}</code>")
+        if b["status"] in ("running", "crashed"):
+            rows.append([(f"⏹️ Arrêter #{b['id']} {b['name'][:20]}", f"ad:stop:{b['id']}")])
+    rows.append(back)
+    return "🤖 <b>Bots</b> (15 derniers)\n\n" + "\n".join(lines), kb(*rows)
+
+
+def make_code(args):
+    import secrets
+    try:
+        p = args.split()
+        code, coins, uses = p[0].upper(), int(p[1]), int(p[2])
+        days = int(p[3]) if len(p) > 3 else 0
+        if coins <= 0 or uses <= 0 or days < 0:
+            raise ValueError
+    except (IndexError, ValueError):
+        return False, "Format : CODE coins utilisations [jours]. Ex : BIENVENUE 50 20 7"
+    if code == "AUTO":
+        code = "BRAD-" + secrets.token_hex(3).upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+        return False, "Code invalide (A-Z, 0-9, - et _ ; 3 à 32 caractères)."
+    expires = time.time() + days * 86400 if days else None
+    if not db.create_code(code, coins, uses, expires):
+        return False, "Ce code existe déjà."
+    return True, (f"✅ Code créé : <code>{code}</code>\n{coins} 🪙 · {uses} utilisation(s)"
+                  + (f" · expire dans {days} j" if days else ""))
+
+
+async def do_broadcast(bot: Bot, admin_id, text):
+    ok = fail = 0
+    for uid in db.all_user_ids():
+        if db.is_banned(uid):
+            continue
+        try:
+            await bot.send_message(uid, text, parse_mode=None)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.06)
+    try:
+        await bot.send_message(admin_id, f"📢 Diffusion terminée : {ok} envoyés, {fail} échecs.")
+    except Exception:
+        pass
+
+
+@r.callback_query(F.data.startswith("ad:"))
+async def cb_ad(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        return await cq.answer()
+    parts = cq.data.split(":")
+    act = parts[1]
+    data = await state.get_data()
+    await state.clear()
+    back = [("⬅️ Admin", "admin")]
+
+    if act == "users":
+        s, c = db.user_stats(), db.counts()
+        text = (f"👥 <b>Utilisateurs</b>\n\nTotal : <b>{s['total']}</b>\nNouveaux (24 h) : {s['day']}\n"
+                f"Nouveaux (7 jours) : {s['week']}\n⭐ Premium : {s['premium']}\n🚫 Bannis : {s['banned']}\n"
+                f"👮 Admins ajoutés : {s['admins']}\n\n🤖 Bots : {c['bots']} (🟢 {c['running']} en ligne)")
+        return await edit(cq, text, kb([("🔎 Chercher un utilisateur", "ad:ask:search")], back))
+
+    if act in ("bots", "stop"):
+        if act == "stop":
+            b = db.get_bot(int(parts[2]))
+            if b:
+                await asyncio.to_thread(runner.stop, b["id"])
+                db.set_status(b["id"], "stopped")
+                try:
+                    await cq.bot.send_message(b["owner"], f"⏹️ Ton bot {esc(b['name'])} a été arrêté par un administrateur.")
+                except Exception:
+                    pass
+            await cq.answer("Arrêté.")
+        text, mk = admin_bots_screen()
+        return await edit(cq, text, mk)
+
+    if act == "codes":
+        lines = []
+        for c in db.list_codes(10):
+            exp = time.strftime("%d/%m", time.localtime(c["expires"])) if c["expires"] else "∞"
+            lines.append(f"<code>{c['code']}</code> · {c['coins']} 🪙 · {c['used']}/{c['max_uses']} · exp {exp}")
+        return await edit(cq, "🎟️ <b>Codes cadeaux</b>\n\n" + ("\n".join(lines) or "Aucun code."),
+                          kb([("➕ Créer", "ad:ask:code_new"), ("🗑️ Supprimer", "ad:ask:code_del")], back))
+
+    if act == "img":
+        sub = parts[2] if len(parts) > 2 else ""
+        if sub == "set":
+            await state.set_state(AdminFlow.photo)
+            return await edit(cq, "📷 Envoie la nouvelle image du menu <b>comme photo</b> (pas comme fichier).",
+                              kb([("❌ Annuler", "admin")]))
+        if sub == "rm":
+            db.del_setting("welcome_photo")
+            await cq.answer("Image personnalisée retirée.")
+        if db.get_setting("welcome_photo"):
+            status = "✅ Image personnalisée active"
+        elif os.path.exists(WELCOME_IMAGE):
+            status = "🖼️ Image par défaut"
+        else:
+            status = "Aucune image (texte seul)"
+        return await edit(cq, f"🖼️ <b>Image du menu</b>\n\n{status}",
+                          kb([("📷 Changer l'image", "ad:img:set")],
+                             [("🗑️ Retirer la personnalisée", "ad:img:rm")], back))
+
+    if act == "prem":
+        ids = db.premium_ids(20)
+        lines = [f"⭐ <code>{i}</code> {uname(db.get_user(i))}" for i in ids]
+        return await edit(cq, (f"⭐ <b>Premium</b> ({len(ids)}) : jusqu'à {PREMIUM_MAX_BOTS} bots\n\n"
+                               + ("\n".join(lines) or "Aucun utilisateur premium.")),
+                          kb([("➕ Nommer premium", "ad:ask:prem_add"), ("➖ Retirer", "ad:ask:prem_del")], back))
+
+    if act == "rm":
+        db.del_admin(int(parts[2]))
+        await cq.answer("Administrateur retiré.")
+        act = "admins"
+
+    if act == "admins":
+        lines = [f"👑 <code>{i}</code> (propriétaire)" for i in sorted(ADMINS)]
+        rows = [[("➕ Nommer un administrateur", "ad:ask:add_admin")]]
+        for i in db.admin_ids():
+            lines.append(f"👮 <code>{i}</code> {uname(db.get_user(i))}")
+            rows.append([(f"❌ Retirer {i}", f"ad:rm:{i}")])
+        rows.append(back)
+        return await edit(cq, "👮 <b>Administrateurs</b>\n\n" + ("\n".join(lines) or "Aucun."), kb(*rows))
+
+    if act == "ban":
+        ids = db.banned_ids(20)
+        lines = [f"🚫 <code>{i}</code> {uname(db.get_user(i))}" for i in ids]
+        return await edit(cq, f"🚫 <b>Bannis</b> ({len(ids)})\n\n" + ("\n".join(lines) or "Personne."),
+                          kb([("🚫 Bannir", "ad:ask:ban"), ("✅ Débannir", "ad:ask:unban")], back))
+
+    if act == "gate":
+        sub = parts[2] if len(parts) > 2 else ""
+        if sub in ("on", "off"):
+            db.set_setting("gate", "1" if sub == "on" else "0")
+        lines = []
+        try:
+            me = await cq.bot.me()
+        except Exception:
+            me = None
+        for c in REQUIRED_CHATS:
+            try:
+                cm = await cq.bot.get_chat_member(c, me.id)
+                good = cm.status in ("administrator", "creator")
+                lines.append(f"{chat_label(c)} : " + ("✅ vérifiable (bot admin)" if good else "⚠️ bot non administrateur"))
+            except Exception:
+                lines.append(f"{chat_label(c)} : ❌ introuvable (ID faux ou bot absent)")
+        toggle = ("🔓 Désactiver", "ad:gate:off") if gate_on() else ("🔒 Activer", "ad:gate:on")
+        return await edit(cq, ("🔒 <b>Obligation de rejoindre</b>\n\nÉtat : "
+                               + ("🔒 <b>activée</b>" if gate_on() else "🔓 <b>désactivée</b>") + "\n\n"
+                               + "\n".join(lines)
+                               + "\n\nLe bot doit être administrateur du canal et du groupe pour vérifier les membres."),
+                          kb([toggle], back))
+
+    if act == "pending":
+        rows = [[(f"✅ #{b['id']} {b['name']}", f"adm:ok:{b['id']}"), (f"❌ #{b['id']}", f"adm:no:{b['id']}")]
+                for b in db.bots_by_status("pending")]
+        rows.append(back)
+        return await edit(cq, "🟡 <b>Bots à valider</b>", kb(*rows))
+
+    if act == "ask":
+        key = parts[2] if len(parts) > 2 else ""
+        if key not in PROMPTS:
+            return await cq.answer()
+        await state.set_state(AdminFlow.wait)
+        await state.update_data(act=key)
+        return await edit(cq, PROMPTS[key], kb([("❌ Annuler", "admin")]))
+
+    if act == "bcgo":
+        text = data.get("bc_text")
+        if not text:
+            return await cq.answer("Rien à envoyer.", show_alert=True)
+        await cq.answer("Envoi en cours…")
+        task = asyncio.create_task(do_broadcast(cq.bot, cq.from_user.id, text))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
+        return await edit(cq, "📢 Diffusion lancée. Je te préviens à la fin.", kb(back))
+
+    await cq.answer()
+
+
+@r.message(AdminFlow.wait, F.text)
+async def admin_text(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await state.clear()
+    text = m.text.strip()
+    back = kb([("⬅️ Admin", "admin")])
+    if text.startswith("/"):
+        await state.clear()
+        return await m.answer("Action annulée.", reply_markup=back)
+    act = (await state.get_data()).get("act")
+
+    if act == "bc":
+        await state.update_data(bc_text=text)
+        n = len([i for i in db.all_user_ids() if not db.is_banned(i)])
+        return await m.answer(f"📢 <b>Aperçu</b>\n\n{esc(text)}\n\nEnvoyer à <b>{n}</b> utilisateurs ?",
+                              reply_markup=kb([(f"✅ Envoyer à {n}", "ad:bcgo"), ("❌ Annuler", "admin")]))
+
+    if act == "code_new":
+        ok, msg = make_code(text)
+        if ok:
+            await state.clear()
+        return await m.answer(msg, reply_markup=back if ok else None)
+
+    if act == "code_del":
+        found = db.del_code(text.upper())
+        await state.clear()
+        return await m.answer("🗑️ Code supprimé." if found else "Code introuvable.", reply_markup=back)
+
+    target = text
+    amount = 0
+    if act == "coins":
+        words = text.split()
+        try:
+            amount, target = int(words[-1]), " ".join(words[:-1])
+            if amount == 0:
+                raise ValueError
+        except (ValueError, IndexError):
+            return await m.answer("Format : ID_ou_@pseudo montant (ex : 123456789 50). Réessaie ou annule.")
+
+    u = db.find_user(target)
+    if not u:
+        return await m.answer("Utilisateur introuvable (il doit avoir ouvert le bot). Réessaie ou annule.")
+    tid = u["id"]
+    await state.clear()
+
+    async def notify(msg):
+        try:
+            await m.bot.send_message(tid, msg)
+        except Exception:
+            pass
+
+    if act == "search":
+        info = (f"🔎 <b>Utilisateur</b>\n\nID : <code>{tid}</code>\nPseudo : {uname(u)}\n"
+                f"🪙 Solde : {u['coins']}\n🤖 Bots : {len(db.user_bots(tid))}\n"
+                f"⭐ Premium : {'oui' if db.is_premium(tid) else 'non'}\n"
+                f"🚫 Banni : {'oui' if db.is_banned(tid) else 'non'}\n"
+                f"👮 Admin : {'oui' if is_admin(tid) else 'non'}")
+        return await m.answer(info, reply_markup=back)
+    if act == "add_admin":
+        if is_admin(tid):
+            return await m.answer("Cet utilisateur est déjà administrateur.", reply_markup=back)
+        db.add_admin(tid, m.from_user.id)
+        await notify("👮 Tu es maintenant administrateur. Ouvre /start puis « 🛠️ Admin ».")
+        return await m.answer(f"✅ {uname(u)} <code>{tid}</code> est administrateur.", reply_markup=back)
+    if act == "prem_add":
+        db.set_premium(tid)
+        await notify(f"⭐ Tu es maintenant premium ! Tu peux déployer jusqu'à {PREMIUM_MAX_BOTS} bots.")
+        return await m.answer(f"✅ {uname(u)} <code>{tid}</code> est premium.", reply_markup=back)
+    if act == "prem_del":
+        found = db.del_premium(tid)
+        return await m.answer("✅ Premium retiré." if found else "Cet utilisateur n'était pas premium.", reply_markup=back)
+    if act == "coins":
+        new = db.adjust_coins(tid, amount)
+        verb = "ajouté" if amount > 0 else "retiré"
+        await notify(f"🪙 Un administrateur a {verb} {abs(amount)} 🪙 sur ton compte. Solde : {new}")
+        return await m.answer(f"✅ {uname(u)} <code>{tid}</code> : solde = <b>{new} 🪙</b>", reply_markup=back)
+    if act == "ban":
+        if is_admin(tid):
+            return await m.answer("Impossible de bannir un administrateur.", reply_markup=back)
+        db.ban(tid)
+        for b in db.user_bots(tid):
+            await asyncio.to_thread(runner.stop, b["id"])
+            if b["status"] == "running":
+                db.set_status(b["id"], "stopped")
+        return await m.answer(f"🚫 {uname(u)} <code>{tid}</code> est banni (ses bots sont arrêtés).", reply_markup=back)
+    if act == "unban":
+        found = db.unban(tid)
+        if found:
+            await notify("✅ Ton accès a été rétabli.")
+        return await m.answer("✅ Utilisateur débanni." if found else "Cet utilisateur n'était pas banni.", reply_markup=back)
+    await m.answer("Action inconnue.", reply_markup=back)
+
+
+@r.message(AdminFlow.photo, F.photo)
+async def admin_photo(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await state.clear()
+    db.set_setting("welcome_photo", m.photo[-1].file_id)
+    await state.clear()
+    await m.answer("✅ Image du menu mise à jour.", reply_markup=kb([("👀 Voir l'accueil", "home")], [("⬅️ Admin", "admin")]))
+
+
+@r.message(AdminFlow.photo)
+async def admin_photo_wrong(m: Message):
+    await m.answer("Envoie l'image comme photo (pas comme fichier), ou /start pour annuler.")
 
 
 @r.callback_query(F.data.startswith("adm:"))
@@ -589,6 +941,126 @@ async def gift_code(m: Message, state: FSMContext):
         return await m.answer(GIFT_ERRORS[status] + "\nRéessaie, ou /start pour annuler.")
     await state.clear()
     await m.answer(f"🎉 Code validé ! <b>+{coins} 🪙</b>", reply_markup=kb([("🏠 Menu", "home")]))
+
+
+# ---------- accès : bannis, admins, premium ----------
+class BanGuard(BaseMiddleware):
+    """Bloque les utilisateurs bannis (les admins ne sont jamais bloqués)."""
+    async def __call__(self, handler, event, data):
+        u = getattr(event, "from_user", None)
+        if u and db.is_banned(u.id) and not is_admin(u.id):
+            try:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("⛔ Ton accès est suspendu.", show_alert=True)
+                else:
+                    await event.answer("⛔ Ton accès est suspendu.")
+            except Exception:
+                pass
+            return
+        return await handler(event, data)
+
+
+r.message.outer_middleware(BanGuard())
+r.callback_query.outer_middleware(BanGuard())
+
+
+# ---------- obligation de rejoindre (canal + groupe Telegram) ----------
+REQUIRED_CHATS = [int(x) for x in os.getenv("REQUIRED_CHATS", "-1004286759333,-1004401259043")
+                  .replace(" ", "").split(",") if x]
+_member_cache = {}  # (uid, chat) -> horodatage de la dernière vérification positive
+_warned = {}        # chat -> horodatage du dernier avertissement envoyé aux admins
+
+
+def gate_on():
+    return bool(REQUIRED_CHATS) and db.get_setting("gate") != "0"
+
+
+def chat_label(c):
+    return "📢 Canal Telegram" if REQUIRED_CHATS and c == REQUIRED_CHATS[0] else "💬 Groupe Telegram"
+
+
+def gate_markup():
+    return kb([("📢 Canal Telegram", TG_CHANNEL), ("💬 Groupe Telegram", TG_GROUP)],
+              [("📱 Chaîne WhatsApp", WA_CHANNEL)],
+              [("👥 Communauté WhatsApp", WA_COMMUNITY), ("💬 Groupe WhatsApp", WA_GROUP)],
+              [("✅ J'ai rejoint", "joined")])
+
+
+async def warn_admins(bot: Bot, chat, err):
+    """Prévient les admins (max 1 fois par heure) quand l'adhésion ne peut pas être vérifiée."""
+    now = time.time()
+    if now - _warned.get(chat, 0) < 3600:
+        return
+    _warned[chat] = now
+    logging.warning("Vérification impossible pour %s : %s", chat, err)
+    for a in all_admins():
+        try:
+            await bot.send_message(a, f"⚠️ Impossible de vérifier l'adhésion à {chat_label(chat)} ({chat}). "
+                                      "Ajoute le bot comme administrateur de ce canal/groupe. "
+                                      "En attendant, l'accès n'est pas bloqué.")
+        except Exception:
+            pass
+
+
+async def is_member(bot: Bot, chat, uid):
+    now = time.time()
+    if now - _member_cache.get((uid, chat), 0) < 300:
+        return True
+    try:
+        cm = await bot.get_chat_member(chat, uid)
+    except Exception as e:  # bot non admin, ID faux… : on ne bloque pas les utilisateurs pour ça
+        await warn_admins(bot, chat, e)
+        return True
+    ok = cm.status in ("creator", "administrator", "member") or (
+        cm.status == "restricted" and getattr(cm, "is_member", False))
+    if ok:
+        _member_cache[(uid, chat)] = now
+    return ok
+
+
+async def missing_chats(bot: Bot, uid):
+    if not gate_on() or is_admin(uid):
+        return []
+    return [c for c in REQUIRED_CHATS if not await is_member(bot, c, uid)]
+
+
+class JoinGuard(BaseMiddleware):
+    """Bloque les utilisateurs qui n'ont pas rejoint le canal et le groupe (sauf /start et « J'ai rejoint »)."""
+    async def __call__(self, handler, event, data):
+        u = getattr(event, "from_user", None)
+        if not u or is_admin(u.id) or not gate_on():
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            if event.data in ("joined", "home"):
+                return await handler(event, data)
+        elif (getattr(event, "text", None) or "").startswith("/start"):
+            return await handler(event, data)
+        if not await missing_chats(event.bot, u.id):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            await event.answer("🔒 Rejoins d'abord le canal et le groupe Telegram (voir /start).", show_alert=True)
+        else:
+            await send_home(event.bot, u.id, u.id, getattr(u, "first_name", ""))
+        return
+
+
+r.message.outer_middleware(JoinGuard())
+r.callback_query.outer_middleware(JoinGuard())
+
+
+@r.callback_query(F.data == "joined")
+async def cb_joined(cq: CallbackQuery):
+    uid = cq.from_user.id
+    missing = await missing_chats(cq.bot, uid)
+    if missing:
+        names = " et ".join(chat_label(c) for c in missing)
+        return await cq.answer(f"🔒 Il te manque : {names}. Rejoins puis réessaie.", show_alert=True)
+    await cq.answer("✅ Bienvenue !")
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await send_home(cq.bot, uid, uid, cq.from_user.first_name)
 
 
 # ---------- surveillance ----------

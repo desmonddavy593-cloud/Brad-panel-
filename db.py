@@ -150,3 +150,115 @@ def redeem_code(uid, code):
         except Exception:
             _c.execute("ROLLBACK")
             raise
+
+
+# ---- administration : admins, premium, bannis, réglages
+_c.executescript("""
+CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY, added_by INTEGER, ts REAL);
+CREATE TABLE IF NOT EXISTS premium(id INTEGER PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS banned(id INTEGER PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+""")
+
+
+def is_db_admin(uid):
+    return _one("SELECT 1 x FROM admins WHERE id=?", (uid,)) is not None
+
+
+def add_admin(uid, by):
+    _x("INSERT OR IGNORE INTO admins(id,added_by,ts) VALUES(?,?,?)", (uid, by, time.time()))
+
+
+def del_admin(uid):
+    return _x("DELETE FROM admins WHERE id=?", (uid,))[2] == 1
+
+
+def admin_ids():
+    return [r["id"] for r in _x("SELECT id FROM admins ORDER BY ts")[0]]
+
+
+def is_premium(uid):
+    return _one("SELECT 1 x FROM premium WHERE id=?", (uid,)) is not None
+
+
+def set_premium(uid):
+    _x("INSERT OR IGNORE INTO premium(id,ts) VALUES(?,?)", (uid, time.time()))
+
+
+def del_premium(uid):
+    return _x("DELETE FROM premium WHERE id=?", (uid,))[2] == 1
+
+
+def premium_ids(limit=20):
+    return [r["id"] for r in _x("SELECT id FROM premium ORDER BY ts DESC LIMIT ?", (limit,))[0]]
+
+
+def is_banned(uid):
+    return _one("SELECT 1 x FROM banned WHERE id=?", (uid,)) is not None
+
+
+def ban(uid):
+    _x("INSERT OR IGNORE INTO banned(id,ts) VALUES(?,?)", (uid, time.time()))
+
+
+def unban(uid):
+    return _x("DELETE FROM banned WHERE id=?", (uid,))[2] == 1
+
+
+def banned_ids(limit=20):
+    return [r["id"] for r in _x("SELECT id FROM banned ORDER BY ts DESC LIMIT ?", (limit,))[0]]
+
+
+def get_setting(key):
+    row = _one("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row else None
+
+
+def set_setting(key, value):
+    _x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+       (key, value))
+
+
+def del_setting(key):
+    _x("DELETE FROM settings WHERE key=?", (key,))
+
+
+def find_user(q):
+    """Cherche un utilisateur par ID numérique ou @pseudo."""
+    q = (q or "").strip()
+    if q.startswith("@"):
+        return _one("SELECT * FROM users WHERE lower(username)=lower(?)", (q[1:],))
+    if q.lstrip("-").isdigit():
+        return _one("SELECT * FROM users WHERE id=?", (int(q),))
+    return None
+
+
+def adjust_coins(uid, n):
+    """Ajoute (ou retire si n < 0) des coins, sans passer sous 0. Retourne le nouveau solde."""
+    _x("UPDATE users SET coins=MAX(0, coins+?) WHERE id=?", (n, uid))
+    return get_user(uid)["coins"]
+
+
+def del_code(code):
+    _x("DELETE FROM code_uses WHERE code=?", (code,))
+    return _x("DELETE FROM codes WHERE code=?", (code,))[2] == 1
+
+
+def all_bots(limit=15):
+    return _x("SELECT * FROM bots ORDER BY id DESC LIMIT ?", (limit,))[0]
+
+
+def user_stats():
+    now = time.time()
+
+    def n(sql, *args):
+        return _one(sql, args)["c"]
+
+    return {
+        "total": n("SELECT COUNT(*) c FROM users"),
+        "day": n("SELECT COUNT(*) c FROM users WHERE created>=?", now - 86400),
+        "week": n("SELECT COUNT(*) c FROM users WHERE created>=?", now - 7 * 86400),
+        "premium": n("SELECT COUNT(*) c FROM premium"),
+        "banned": n("SELECT COUNT(*) c FROM banned"),
+        "admins": n("SELECT COUNT(*) c FROM admins"),
+    }
