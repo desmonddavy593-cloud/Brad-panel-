@@ -1028,7 +1028,7 @@ class JoinGuard(BaseMiddleware):
     """Bloque les utilisateurs qui n'ont pas rejoint le canal et le groupe (sauf /start et « J'ai rejoint »)."""
     async def __call__(self, handler, event, data):
         u = getattr(event, "from_user", None)
-        if not u or is_admin(u.id) or not gate_on():
+        if not u or getattr(u, "is_bot", False) or is_admin(u.id) or not gate_on():
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
             if event.data in ("joined", "home"):
