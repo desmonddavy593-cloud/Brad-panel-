@@ -118,6 +118,15 @@ def alive(bid):
     return p is not None and p.poll() is None
 
 
+def extract_npm_error(stderr, stdout):
+    """Garde les vraies lignes d'erreur npm (error/ERR!), pas les notices de fin (ex: mise à jour npm)."""
+    combined = (stderr or "") + "\n" + (stdout or "")
+    lines = [l for l in combined.splitlines()
+             if re.search(r"npm (error|ERR!)", l, re.I) and "notice" not in l.lower()]
+    text = "\n".join(lines) if lines else combined
+    return text.strip()[-500:] or "erreur inconnue (aucune sortie)"
+
+
 def _install_node(root, base_env):
     marker = os.path.join(root, ".deps_installed")
     if os.path.exists(marker) or not os.path.exists(os.path.join(root, "package.json")):
@@ -135,7 +144,7 @@ def _install_node(root, base_env):
     except FileNotFoundError:
         return False, "Node.js/npm introuvable sur le serveur."
     if r.returncode != 0:
-        return False, "npm install : " + (r.stderr or r.stdout)[-300:]
+        return False, "npm install : " + extract_npm_error(r.stderr, r.stdout)
     open(marker, "w").close()
     return True, ""
 
